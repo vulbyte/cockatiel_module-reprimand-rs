@@ -1,0 +1,16 @@
+{
+  "name": "reprimand",
+  "description": "chat-command reprimand — any verified user may reprimand another user once per 24h (enforced in the user DB rating_history); parses !reprimand <user> <reason>",
+  "version": "0.1.0",
+  "capabilities": "preprocess",
+  "root_file": "./src/main.rs",
+  "launch_command": "cargo run",
+  "command_flags": ["--release"],
+  "autostart": false,
+  "terminal": false,
+  "binary": {
+    "macos": { "x86_64": "target/release/cockatiel_reprimand", "aarch64": "target/release/cockatiel_reprimand", "arm": "target/release/cockatiel_reprimand" },
+    "linux": { "x86_64": "target/release/cockatiel_reprimand", "aarch64": "target/release/cockatiel_reprimand", "arm": "target/release/cockatiel_reprimand" },
+    "windows": { "x86_64": "target/release/cockatiel_reprimand.exe", "aarch64": "target/release/cockatiel_reprimand.exe", "arm": "target/release/cockatiel_reprimand.exe" }
+  }
+}
