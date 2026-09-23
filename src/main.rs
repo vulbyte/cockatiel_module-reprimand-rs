@@ -16,6 +16,40 @@ type WsWriteHalf = futures_util::stream::SplitSink<
 >;
 
 const COMMAND_NAME: &str = "reprimand";
+const DEFAULT_FLAG: &str = "!";
+
+/// Module config convention: settings live in config.json's `module_specific`
+/// and are created (with defaults) when missing. Returns the configured
+/// command flag (e.g. "!"), defaulting to `DEFAULT_FLAG`.
+fn ensure_defaults() -> String {
+    let flag = std::fs::read_to_string("config.json")
+        .ok()
+        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
+        .and_then(|root| {
+            root.get("module_specific")
+                .and_then(|ms| ms.get("command_flag"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        });
+    let flag = flag.unwrap_or_else(|| DEFAULT_FLAG.to_string());
+    // Write the default back so the setting always exists.
+    if let Ok(data) = std::fs::read_to_string("config.json") {
+        if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&data) {
+            if let Some(obj) = root.as_object_mut() {
+                if let Some(ms) = obj
+                    .entry("module_specific".to_string())
+                    .or_insert_with(|| serde_json::json!({}))
+                    .as_object_mut()
+                {
+                    ms.entry("command_flag".to_string())
+                        .or_insert_with(|| serde_json::json!(flag));
+                }
+                let _ = std::fs::write("config.json", serde_json::to_string_pretty(&root).unwrap());
+            }
+        }
+    }
+    flag
+}
 
 /// Strip the `<flag><command>` prefix (and any parsed `-flag` tokens) from a
 /// raw command message, leaving the positional args (target + reason).
@@ -66,7 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // before registering so the Commands payload isn't discarded.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
 
-    // Register the command with the engine: `!reprimand <user> <reason>`.
+    // Register the command with the engine: `<flag>reprimand <user> <reason>`.
+    let command_flag = ensure_defaults();
     {
         let commands = Container {
             version: 1,
@@ -76,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             payload: Some(Payload::CommandsPayload(Commands {
                 commands: vec![Command {
                     command_name: COMMAND_NAME.to_string(),
-                    command_flag: "!".to_string(),
+                    command_flag: command_flag.clone(),
                     command_description: "reprimand a user (once per 24h per person)".to_string(),
                     command_flags: vec![],
                 }],
@@ -169,4 +204,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strips_flag_and_command_keeps_args() {
+        assert_eq!(strip_command("!reprimand @user being rude", "!", "reprimand"), "@user being rude");
+    }
+
+    #[test]
+    fn strips_mention_symbol_style() {
+        assert_eq!(strip_command("!reprimand  @user", "!", "reprimand"), "@user");
+    }
+
+    #[test]
+    fn strips_flag_tokens_and_keeps_positional() {
+        // The command isn't ours (no flags), but strip_command also drops any
+        // -flag tokens it encounters, keeping the positional args.
+        assert_eq!(strip_command("!reprimand -v high @user rude", "!", "reprimand"), "@user rude");
+    }
+
+    #[test]
+    fn empty_args_when_only_command() {
+        assert_eq!(strip_command("!reprimand", "!", "reprimand"), "");
+    }
 }
