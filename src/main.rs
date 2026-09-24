@@ -3,7 +3,7 @@ use prost::Message;
 use std::sync::Arc;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
 use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient};
@@ -51,8 +51,58 @@ fn ensure_defaults() -> String {
     flag
 }
 
-/// Strip the `<flag><command>` prefix (and any parsed `-flag` tokens) from a
-/// raw command message, leaving the positional args (target + reason).
+/// Session identity (auth token + module ids) shared between the read loop and
+/// the query sender so a reconnect's fresh credentials are picked up by both.
+#[derive(Clone)]
+struct EngineIdentity {
+    auth: String,
+    instance: String,
+    module: String,
+}
+
+/// Encode and send a Container on the shared write half.
+async fn send_container(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: Container) {
+    let mut buf = Vec::new();
+    if container.encode(&mut buf).is_ok() {
+        let mut w = write_shared.lock().await;
+        let _ = w.send(WsMessage::Binary(buf)).await;
+    }
+}
+
+/// Register the chat command with the engine. Called on every fresh session
+/// (initial connect and each reconnect — the engine forgets a session's
+/// commands when the socket drops).
+async fn register_commands(
+    write_shared: &Arc<AsyncMutex<WsWriteHalf>>,
+    identity: &Arc<AsyncMutex<EngineIdentity>>,
+    command_flag: &str,
+) {
+    let id = identity.lock().await.clone();
+    let commands = Container {
+        version: 1,
+        auth_token: id.auth,
+        module_name: id.module,
+        module_instance_uuid7: id.instance,
+        payload: Some(Payload::CommandsPayload(Commands {
+            commands: vec![Command {
+                command_name: COMMAND_NAME.to_string(),
+                command_flag: command_flag.to_string(),
+                command_description: "reprimand a user (once per 24h per person)".to_string(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: false,
+        })),
+    };
+    send_container(write_shared, commands).await;
+    info!("registered !{} command", COMMAND_NAME);
+}
+
+/// Extract the positional args (target + reason) from a routed command. The
+/// engine already parsed the command (it attached `chat.command`), so we only
+/// strip the `<flag><command>` prefix and keep everything after verbatim. This
+/// module registers NO flags, so a `-word` inside the reason is reason text,
+/// not a flag — the old dash-scanning heuristic (which dropped a token AFTER a
+/// `-flag` token) is gone.
 fn strip_command(raw: &str, flag: &str, name: &str) -> String {
     let mut rest = raw.trim().to_string();
     if let Some(idx) = rest.find(flag) {
@@ -61,22 +111,7 @@ fn strip_command(raw: &str, flag: &str, name: &str) -> String {
     if rest.starts_with(name) {
         rest = rest[name.len()..].trim_start().to_string();
     }
-    // Drop any `-flag [value]` tokens — the positional args come after.
-    let mut kept: Vec<&str> = Vec::new();
-    let tokens: Vec<&str> = rest.split_whitespace().collect();
-    let mut i = 0;
-    while i < tokens.len() {
-        let t = tokens[i];
-        if t.starts_with('-') && t.len() > 1 {
-            if i + 1 < tokens.len() && !tokens[i + 1].starts_with('-') {
-                i += 1;
-            }
-        } else {
-            kept.push(t);
-        }
-        i += 1;
-    }
-    kept.join(" ")
+    rest
 }
 
 #[tokio::main]
@@ -89,118 +124,193 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::subscriber::set_global_default(subscriber).unwrap();
 
     let client = CockatielClient::connect("config.json").await?;
-    let (write, mut read) = client.stream.split();
+    let (write, read) = client.stream.split();
     let write_shared: Arc<AsyncMutex<WsWriteHalf>> = Arc::new(AsyncMutex::new(write));
-    let auth_token = client.auth_token.clone();
-    let instance_uuid = client.instance_uuid7.clone();
     let module_name = client.config.module_name.clone();
     info!("reprimand module connected as '{}'", module_name);
+    let identity: Arc<AsyncMutex<EngineIdentity>> = Arc::new(AsyncMutex::new(EngineIdentity {
+        auth: client.auth_token.clone(),
+        instance: client.instance_uuid7.clone(),
+        module: module_name,
+    }));
 
-    // The engine drains frames sent within its ~40ms post-auth window; settle
-    // before registering so the Commands payload isn't discarded.
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-
-    // Register the command with the engine: `<flag>reprimand <user> <reason>`.
-    let command_flag = ensure_defaults();
-    {
-        let commands = Container {
-            version: 1,
-            auth_token: auth_token.clone(),
-            module_name: module_name.clone(),
-            module_instance_uuid7: instance_uuid.clone(),
-            payload: Some(Payload::CommandsPayload(Commands {
-                commands: vec![Command {
-                    command_name: COMMAND_NAME.to_string(),
-                    command_flag: command_flag.clone(),
-                    command_description: "reprimand a user (once per 24h per person)".to_string(),
-                    command_flags: vec![],
-                }],
-                alert_on_unknown_command: false,
-            })),
-        };
-        let mut buf = Vec::new();
-        commands.encode(&mut buf)?;
-        let mut w = write_shared.lock().await;
-        w.send(WsMessage::Binary(buf.into())).await?;
-        drop(w);
-        info!("registered !{} command", COMMAND_NAME);
-    }
-
-    // Read task: handle routed command messages.
+    // Channel carrying parsed ratings to the (serialized) engine query sender.
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<serde_json::Value>();
-    let read_tx = tx.clone();
+
+    // Read loop + engine-session supervisor: owns the read half, answers
+    // liveness probes, acks every pre-process/in-process stage, surfaces
+    // DatabaseQueryResult failures, and reconnects with backoff — re-registering
+    // the command on each fresh session.
+    let command_flag = ensure_defaults();
     let write_for_task = Arc::clone(&write_shared);
-    let auth_for_task = auth_token.clone();
-    let module_for_task = module_name.clone();
-    let instance_for_task = instance_uuid.clone();
+    let identity_for_task = Arc::clone(&identity);
+    let tx_for_task = tx.clone();
+    let command_flag_for_task = command_flag.clone();
     tokio::spawn(async move {
-        while let Some(msg) = read.next().await {
-            let Ok(WsMessage::Binary(data)) = msg else { continue };
-            let Ok(container) = Container::decode(data.as_ref()) else { continue };
-            match container.payload {
-                Some(Payload::AuthVerify(_)) => {
-                    let reply = Container {
-                        version: 1,
-                        auth_token: auth_for_task.clone(),
-                        module_name: module_for_task.clone(),
-                        module_instance_uuid7: instance_for_task.clone(),
-                        payload: Some(Payload::AuthVerify(AuthVerify {
-                            cur_auth: auth_for_task.clone(),
-                        })),
-                    };
-                    let mut buf = Vec::new();
-                    if reply.encode(&mut buf).is_ok() {
-                        let mut w = write_for_task.lock().await;
-                        let _ = w.send(WsMessage::Binary(buf.into())).await;
+        let mut read = read;
+        loop {
+            // Fresh session (initial connect + every reconnect): register the
+            // command — the engine forgets commands when a socket drops.
+            register_commands(&write_for_task, &identity_for_task, &command_flag_for_task).await;
+            loop {
+                let Some(msg) = read.next().await else { break };
+                let data = match msg {
+                    Ok(WsMessage::Binary(d)) => d,
+                    Ok(WsMessage::Close(_)) => {
+                        info!("Engine closed connection");
+                        break;
+                    }
+                    Ok(_) => continue,
+                    Err(e) => {
+                        warn!("Engine WebSocket error: {}", e);
+                        break;
+                    }
+                };
+                let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                let id = identity_for_task.lock().await.clone();
+                match container.payload {
+                    Some(Payload::AuthVerify(_)) => {
+                        let reply = Container {
+                            version: 1,
+                            auth_token: id.auth.clone(),
+                            module_name: id.module.clone(),
+                            module_instance_uuid7: id.instance.clone(),
+                            payload: Some(Payload::AuthVerify(AuthVerify {
+                                cur_auth: id.auth.clone(),
+                            })),
+                        };
+                        send_container(&write_for_task, reply).await;
+                    }
+                    Some(Payload::DatabaseQueryResult(res)) => {
+                        // Surface query failures (cooldown denial, target not
+                        // found, self-rating rejection) so the operator sees
+                        // them; no platform reply is sent.
+                        if !res.success {
+                            eprintln!(
+                                "[reprimand] rating query '{}' failed: {}",
+                                res.query_id, res.error
+                            );
+                        }
+                    }
+                    Some(Payload::MessagePreProcess(pre)) => {
+                        let MessagePreProcess {
+                            message_uuid7: uuid,
+                            raw_message,
+                            audio,
+                            audio_type,
+                        } = pre;
+                        // Handle our routed command when present.
+                        if let Some(chat) = &raw_message {
+                            if let Some(cmd) = &chat.command {
+                                if cmd.command_name == COMMAND_NAME {
+                                    let args =
+                                        strip_command(&chat.raw_message, &cmd.command_flag, &cmd.command_name);
+                                    let mut parts = args.split_whitespace();
+                                    if let Some(target) = parts.next() {
+                                        let reason = parts.collect::<Vec<_>>().join(" ");
+                                        let target_clean = target
+                                            .strip_prefix('@')
+                                            .unwrap_or(target)
+                                            .to_string();
+                                        let _ = tx_for_task.send(serde_json::json!({
+                                            "platform": chat.platform,
+                                            "handle": target_clean,
+                                            "reason": reason,
+                                            "actor": {
+                                                "uuid7": chat.user_uuid7,
+                                                "platform": chat.platform,
+                                                "handle": chat.user_data.as_ref().map(|u| u.username.clone()).unwrap_or_default(),
+                                            },
+                                        }));
+                                    }
+                                }
+                            }
+                        }
+                        // ALWAYS ack the pre-process stage: echo the raw
+                        // ChatMessage back with the same message_uuid7 so the
+                        // engine advances instead of stalling until the timeout
+                        // sweep — on every path, command or not.
+                        let ack = Container {
+                            version: 1,
+                            auth_token: id.auth.clone(),
+                            module_name: id.module.clone(),
+                            module_instance_uuid7: id.instance.clone(),
+                            payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+                                message_uuid7: uuid,
+                                raw_message,
+                                audio,
+                                audio_type,
+                            })),
+                        };
+                        send_container(&write_for_task, ack).await;
+                    }
+                    Some(Payload::MessageInProcess(process)) => {
+                        // Pass-through ack of the in-process stage so it never
+                        // stalls (even though this module only declares
+                        // pre-process capability).
+                        let ack = Container {
+                            version: 1,
+                            auth_token: id.auth.clone(),
+                            module_name: id.module.clone(),
+                            module_instance_uuid7: id.instance.clone(),
+                            payload: Some(Payload::MessageInProcess(MessageInProcess {
+                                message_uuid7: process.message_uuid7,
+                                raw_message: process.raw_message,
+                                processed_message: process.processed_message,
+                                abandon_message: process.abandon_message,
+                                audio: process.audio,
+                                audio_type: process.audio_type,
+                            })),
+                        };
+                        send_container(&write_for_task, ack).await;
+                    }
+                    _ => {}
+                }
+            }
+
+            // The engine connection dropped — reconnect with backoff instead of
+            // leaving the module unresponsive.
+            info!("Engine disconnected — reconnecting...");
+            let mut backoff = 1u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                match CockatielClient::connect("config.json").await {
+                    Ok(conn) => {
+                        info!("Reconnected to engine");
+                        let (w, r) = conn.stream.split();
+                        *write_for_task.lock().await = w;
+                        *identity_for_task.lock().await = EngineIdentity {
+                            auth: conn.auth_token,
+                            instance: conn.instance_uuid7,
+                            module: conn.config.module_name,
+                        };
+                        read = r;
+                        break; // back to outer loop → re-register the command
+                    }
+                    Err(e) => {
+                        warn!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
+                        backoff = (backoff * 2).min(30);
                     }
                 }
-                Some(Payload::MessagePreProcess(pre)) => {
-                    let Some(chat) = pre.raw_message else { continue };
-                    let Some(cmd) = chat.command else { continue };
-                    if cmd.command_name != COMMAND_NAME {
-                        continue; // not our command (safety: catch-alls see everything)
-                    }
-                    let args = strip_command(&chat.raw_message, &cmd.command_flag, &cmd.command_name);
-                    let mut parts = args.split_whitespace();
-                    let Some(target) = parts.next() else {
-                        continue; // missing target
-                    };
-                    let reason = parts.collect::<Vec<_>>().join(" ");
-                    let target_clean = target.strip_prefix('@').unwrap_or(target).to_string();
-                    let _ = read_tx.send(serde_json::json!({
-                        "platform": chat.platform,
-                        "handle": target_clean,
-                        "reason": reason,
-                        "actor": {
-                            "uuid7": chat.user_uuid7,
-                            "platform": chat.platform,
-                            "handle": chat.user_data.map(|u| u.username).unwrap_or_default(),
-                        },
-                    }));
-                }
-                _ => {}
             }
         }
     });
 
     // Serialize the ratings: each one goes to the engine's chat_reprimand query.
     while let Some(payload) = rx.recv().await {
+        let id = identity.lock().await.clone();
         let query = Container {
             version: 1,
-            auth_token: auth_token.clone(),
-            module_name: module_name.clone(),
-            module_instance_uuid7: instance_uuid.clone(),
+            auth_token: id.auth,
+            module_name: id.module,
+            module_instance_uuid7: id.instance,
             payload: Some(Payload::DatabaseQuery(DatabaseQuery {
                 query_id: "chat_reprimand".to_string(),
                 sql: payload.to_string(),
                 params: vec![],
             })),
         };
-        let mut buf = Vec::new();
-        if query.encode(&mut buf).is_ok() {
-            let mut w = write_shared.lock().await;
-            let _ = w.send(WsMessage::Binary(buf.into())).await;
-        }
+        send_container(&write_shared, query).await;
     }
 
     Ok(())
@@ -220,10 +330,15 @@ mod tests {
     }
 
     #[test]
-    fn strips_flag_tokens_and_keeps_positional() {
-        // The command isn't ours (no flags), but strip_command also drops any
-        // -flag tokens it encounters, keeping the positional args.
-        assert_eq!(strip_command("!reprimand -v high @user rude", "!", "reprimand"), "@user rude");
+    fn preserves_flag_like_reason_text() {
+        // No flags registered → `-v high` is reason text, not a flag; it is
+        // preserved rather than silently dropped with its value token.
+        assert_eq!(strip_command("!reprimand -v high @user rude", "!", "reprimand"), "-v high @user rude");
+    }
+
+    #[test]
+    fn preserves_dash_word_in_reason_when_no_flags_parsed() {
+        assert_eq!(strip_command("!reprimand @user not -half bad", "!", "reprimand"), "@user not -half bad");
     }
 
     #[test]
