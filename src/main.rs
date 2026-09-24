@@ -17,38 +17,65 @@ type WsWriteHalf = futures_util::stream::SplitSink<
 
 const COMMAND_NAME: &str = "reprimand";
 const DEFAULT_FLAG: &str = "!";
+const DEFAULT_RECONNECT_BASE_SECS: u64 = 1;
+const DEFAULT_RECONNECT_MAX_SECS: u64 = 30;
 
 /// Module config convention: settings live in config.json's `module_specific`
-/// and are created (with defaults) when missing. Returns the configured
-/// command flag (e.g. "!"), defaulting to `DEFAULT_FLAG`.
-fn ensure_defaults() -> String {
-    let flag = std::fs::read_to_string("config.json")
+/// and are created (with defaults) when missing. Reads the configured command
+/// flag (e.g. "!") plus the reconnect backoff bounds, backfilling defaults for
+/// any missing key.
+#[derive(Debug, Clone)]
+struct ModuleSettings {
+    command_flag: String,
+    reconnect_base_secs: u64,
+    reconnect_max_secs: u64,
+}
+
+fn ensure_defaults() -> ModuleSettings {
+    let root: Option<serde_json::Value> = std::fs::read_to_string("config.json")
         .ok()
-        .and_then(|data| serde_json::from_str::<serde_json::Value>(&data).ok())
-        .and_then(|root| {
-            root.get("module_specific")
-                .and_then(|ms| ms.get("command_flag"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-        });
-    let flag = flag.unwrap_or_else(|| DEFAULT_FLAG.to_string());
-    // Write the default back so the setting always exists.
-    if let Ok(data) = std::fs::read_to_string("config.json") {
-        if let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&data) {
-            if let Some(obj) = root.as_object_mut() {
-                if let Some(ms) = obj
-                    .entry("module_specific".to_string())
-                    .or_insert_with(|| serde_json::json!({}))
-                    .as_object_mut()
-                {
-                    ms.entry("command_flag".to_string())
-                        .or_insert_with(|| serde_json::json!(flag));
-                }
-                let _ = std::fs::write("config.json", serde_json::to_string_pretty(&root).unwrap());
+        .and_then(|data| serde_json::from_str(&data).ok());
+    let ms = root
+        .as_ref()
+        .and_then(|r| r.get("module_specific"))
+        .and_then(|ms| ms.as_object())
+        .cloned()
+        .unwrap_or_default();
+    let command_flag = ms
+        .get("command_flag")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| DEFAULT_FLAG.to_string());
+    let reconnect_base_secs = ms
+        .get("reconnect_base_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_RECONNECT_BASE_SECS);
+    let reconnect_max_secs = ms
+        .get("reconnect_max_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_RECONNECT_MAX_SECS);
+    if let Some(mut root) = root {
+        if let Some(obj) = root.as_object_mut() {
+            if let Some(ms) = obj
+                .entry("module_specific".to_string())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+            {
+                ms.entry("command_flag".to_string())
+                    .or_insert_with(|| serde_json::json!(command_flag));
+                ms.entry("reconnect_base_secs".to_string())
+                    .or_insert_with(|| serde_json::json!(reconnect_base_secs));
+                ms.entry("reconnect_max_secs".to_string())
+                    .or_insert_with(|| serde_json::json!(reconnect_max_secs));
             }
+            let _ = std::fs::write("config.json", serde_json::to_string_pretty(&root).unwrap());
         }
     }
-    flag
+    ModuleSettings {
+        command_flag,
+        reconnect_base_secs,
+        reconnect_max_secs,
+    }
 }
 
 /// Session identity (auth token + module ids) shared between the read loop and
@@ -141,7 +168,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // liveness probes, acks every pre-process/in-process stage, surfaces
     // DatabaseQueryResult failures, and reconnects with backoff — re-registering
     // the command on each fresh session.
-    let command_flag = ensure_defaults();
+    let settings = ensure_defaults();
+    let command_flag = settings.command_flag.clone();
+    let reconnect_base_secs = settings.reconnect_base_secs;
+    let reconnect_max_secs = settings.reconnect_max_secs;
     let write_for_task = Arc::clone(&write_shared);
     let identity_for_task = Arc::clone(&identity);
     let tx_for_task = tx.clone();
@@ -271,7 +301,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The engine connection dropped — reconnect with backoff instead of
             // leaving the module unresponsive.
             info!("Engine disconnected — reconnecting...");
-            let mut backoff = 1u64;
+            let mut backoff = reconnect_base_secs;
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
                 match CockatielClient::connect("config.json").await {
@@ -289,7 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     Err(e) => {
                         warn!("Engine reconnect failed: {} — retrying in {}s", e, backoff);
-                        backoff = (backoff * 2).min(30);
+                        backoff = (backoff * 2).min(reconnect_max_secs);
                     }
                 }
             }
