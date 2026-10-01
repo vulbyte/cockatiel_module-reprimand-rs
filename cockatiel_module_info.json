@@ -4,8 +4,9 @@
   "version": "0.1.0",
   "capabilities": "preprocess",
   "root_file": "./src/main.rs",
-  "launch_command": "cargo run",
+  "launch_command": "cargo",
   "command_flags": [
+    "run",
     "--release"
   ],
   "autostart": false,
@@ -29,5 +30,30 @@
   },
   "price": 0,
   "min_rank": 0,
-  "authority": 0
+  "authority": 0,
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "credentials": [
+    {
+      "key": "command_flag",
+      "label": "Command Flag",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "reconnect_base_secs",
+      "label": "Reconnect base (s)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "reconnect_max_secs",
+      "label": "Reconnect max (s)",
+      "list": false,
+      "sensitive": false
+    }
+  ]
 }
