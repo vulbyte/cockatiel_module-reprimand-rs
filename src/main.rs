@@ -6,7 +6,10 @@ use tokio_tungstenite::tungstenite::protocol::Message as WsMessage;
 use tracing::{info, warn};
 use tracing_subscriber::FmtSubscriber;
 
-use cockatiel_client::{proto::container::Payload, proto::*, CockatielClient};
+use cockatiel_client::proto::container_for_engine::Payload as EnginePayload;
+use cockatiel_client::proto::container_for_module::Payload as ModulePayload;
+use cockatiel_client::proto::*;
+use cockatiel_client::CockatielClient;
 
 type WsWriteHalf = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<
@@ -87,8 +90,8 @@ struct EngineIdentity {
     module: String,
 }
 
-/// Encode and send a Container on the shared write half.
-async fn send_container(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: Container) {
+/// Encode and send a ContainerForEngine on the shared write half.
+async fn send_container(write_shared: &Arc<AsyncMutex<WsWriteHalf>>, container: ContainerForEngine) {
     let mut buf = Vec::new();
     if container.encode(&mut buf).is_ok() {
         let mut w = write_shared.lock().await;
@@ -105,12 +108,12 @@ async fn register_commands(
     command_flag: &str,
 ) {
     let id = identity.lock().await.clone();
-    let commands = Container {
-        version: 1,
+    let commands = ContainerForEngine {
+        version: 2,
         auth_token: id.auth,
         module_name: id.module,
         module_instance_uuid7: id.instance,
-        payload: Some(Payload::CommandsPayload(Commands {
+        payload: Some(EnginePayload::Commands(Commands {
             commands: vec![Command {
                 command_name: COMMAND_NAME.to_string(),
                 command_flag: command_flag.to_string(),
@@ -196,22 +199,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         break;
                     }
                 };
-                let Ok(container) = Container::decode(data.as_ref()) else { continue };
+                let Ok(container) = ContainerForModule::decode(data.as_ref()) else { continue };
                 let id = identity_for_task.lock().await.clone();
                 match container.payload {
-                    Some(Payload::AuthVerify(_)) => {
-                        let reply = Container {
-                            version: 1,
+                    Some(ModulePayload::AuthVerify(_)) => {
+                        let reply = ContainerForEngine {
+                            version: 2,
                             auth_token: id.auth.clone(),
                             module_name: id.module.clone(),
                             module_instance_uuid7: id.instance.clone(),
-                            payload: Some(Payload::AuthVerify(AuthVerify {
+                            payload: Some(EnginePayload::AuthVerify(AuthVerify {
                                 cur_auth: id.auth.clone(),
                             })),
                         };
                         send_container(&write_for_task, reply).await;
                     }
-                    Some(Payload::DatabaseQueryResult(res)) => {
+                    Some(ModulePayload::DatabaseQueryResult(res)) => {
                         // Surface query failures (cooldown denial, target not
                         // found, self-rating rejection) so the operator sees
                         // them; no platform reply is sent.
@@ -222,7 +225,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             );
                         }
                     }
-                    Some(Payload::MessagePreProcess(pre)) => {
+                    Some(ModulePayload::MessagePreProcess(pre)) => {
                         let MessagePreProcess {
                             message_uuid7: uuid,
                             raw_message,
@@ -260,12 +263,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // ChatMessage back with the same message_uuid7 so the
                         // engine advances instead of stalling until the timeout
                         // sweep — on every path, command or not.
-                        let ack = Container {
-                            version: 1,
+                        let ack = ContainerForEngine {
+                            version: 2,
                             auth_token: id.auth.clone(),
                             module_name: id.module.clone(),
                             module_instance_uuid7: id.instance.clone(),
-                            payload: Some(Payload::MessagePreProcess(MessagePreProcess {
+                            payload: Some(EnginePayload::MessagePreProcess(MessagePreProcess {
                                 message_uuid7: uuid,
                                 raw_message,
                                 audio,
@@ -274,16 +277,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         send_container(&write_for_task, ack).await;
                     }
-                    Some(Payload::MessageInProcess(process)) => {
+                    Some(ModulePayload::MessageInProcess(process)) => {
                         // Pass-through ack of the in-process stage so it never
                         // stalls (even though this module only declares
                         // pre-process capability).
-                        let ack = Container {
-                            version: 1,
+                        let ack = ContainerForEngine {
+                            version: 2,
                             auth_token: id.auth.clone(),
                             module_name: id.module.clone(),
                             module_instance_uuid7: id.instance.clone(),
-                            payload: Some(Payload::MessageInProcess(MessageInProcess {
+                            payload: Some(EnginePayload::MessageInProcess(MessageInProcess {
                                 message_uuid7: process.message_uuid7,
                                 raw_message: process.raw_message,
                                 processed_message: process.processed_message,
@@ -329,12 +332,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Serialize the ratings: each one goes to the engine's chat_reprimand query.
     while let Some(payload) = rx.recv().await {
         let id = identity.lock().await.clone();
-        let query = Container {
-            version: 1,
+        let query = ContainerForEngine {
+            version: 2,
             auth_token: id.auth,
             module_name: id.module,
             module_instance_uuid7: id.instance,
-            payload: Some(Payload::DatabaseQuery(DatabaseQuery {
+            payload: Some(EnginePayload::DatabaseQuery(DatabaseQuery {
                 query_id: "chat_reprimand".to_string(),
                 sql: payload.to_string(),
                 params: vec![],
