@@ -46,6 +46,18 @@
       "label": "Reconnect max (s)",
       "list": false,
       "sensitive": false
+    },
+    {
+      "key": "data_dir",
+      "label": "Data directory",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "bans_path",
+      "label": "Bans file (bans.json)",
+      "list": false,
+      "sensitive": false
     }
   ],
   "description": "chat-command reprimand — any verified user may reprimand another user once per 24h (enforced in the user DB rating_history); parses !reprimand <user> <reason>",
